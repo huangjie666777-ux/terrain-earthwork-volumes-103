@@ -16,8 +16,8 @@ from .storage import DatasetMeta
 WEB_MERCATOR = "EPSG:3857"
 
 
-def _source_window(src, bounds_3857: tuple[float, float, float, float]):
-    left, bottom, right, top = transform_bounds(WEB_MERCATOR, src.crs, *bounds_3857, densify_pts=21)
+def _source_window(src, dst_crs, dst_bounds: tuple[float, float, float, float]):
+    left, bottom, right, top = transform_bounds(dst_crs, src.crs, *dst_bounds, densify_pts=21)
     left, bottom, right, top = (
         min(left, right),
         min(bottom, top),
@@ -45,16 +45,24 @@ def _warp_dataset(
     dst_shape: tuple[int, int],
     dst_transform,
     dst_bounds: tuple[float, float, float, float],
+    dst_crs=WEB_MERCATOR,
 ) -> np.ma.MaskedArray:
     """Read only overlapping source pixels and bilinearly warp elevations."""
     height, width = dst_shape
     elev = np.full(dst_shape, np.nan, dtype=np.float32)
     valid = np.zeros(dst_shape, dtype=np.uint8)
     with rasterio.open(path) as src:
-        window = _source_window(src, dst_bounds)
+        window = _source_window(src, dst_crs, dst_bounds)
         if window is None:
             return np.ma.array(elev, mask=True)
         source = src.read(1, window=window, masked=True)
+        # A fully valid raster with neither NoData nor a band mask is returned
+        # with a scalar False mask. Force a 2-D mask so both warp inputs share
+        # the window shape.
+        source = np.ma.array(
+            source.data,
+            mask=np.broadcast_to(np.asarray(source.mask, dtype=bool), source.shape),
+        )
         source_valid = (~source.mask).astype(np.uint8) * 255
         source_transform = src.window_transform(window)
         rasterio.warp.reproject(
@@ -64,7 +72,7 @@ def _warp_dataset(
             src_crs=src.crs,
             src_nodata=src.nodata,
             dst_transform=dst_transform,
-            dst_crs=WEB_MERCATOR,
+            dst_crs=dst_crs,
             dst_nodata=np.nan,
             resampling=Resampling.bilinear,
             num_threads=1,
@@ -75,7 +83,7 @@ def _warp_dataset(
             src_transform=source_transform,
             src_crs=src.crs,
             dst_transform=dst_transform,
-            dst_crs=WEB_MERCATOR,
+            dst_crs=dst_crs,
             dst_nodata=0,
             resampling=Resampling.nearest,
             num_threads=1,
@@ -92,6 +100,7 @@ def build_mosaic(
     dst_transform,
     dst_bounds: tuple[float, float, float, float],
     dataset_dir,
+    dst_crs=WEB_MERCATOR,
 ) -> np.ma.MaskedArray:
     """Fill target cells using the first valid elevation in dataset order."""
     result = np.ma.array(np.full(dst_shape, np.nan, dtype=np.float32), mask=True)
@@ -103,6 +112,7 @@ def build_mosaic(
             dst_shape,
             dst_transform,
             dst_bounds,
+            dst_crs=dst_crs,
         )
         fill = result.mask & ~candidate.mask
         if fill.any():

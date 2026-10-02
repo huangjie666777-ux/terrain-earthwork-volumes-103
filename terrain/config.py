@@ -20,6 +20,9 @@ class Settings:
     max_zoom: int = 18
     max_concurrent_jobs: int = _int("TERRAIN_MAX_CONCURRENT_JOBS", 2)
     cache_max_tiles: int = _int("TERRAIN_CACHE_MAX_TILES", 256)
+    max_cutfill_cells: int = _int("TERRAIN_MAX_CUTFILL_CELLS", 5_000_000)
+    max_concurrent_cutfill: int = _int("TERRAIN_MAX_CONCURRENT_CUTFILL", 1)
+    cutfill_block_rows: int = _int("TERRAIN_CUTFILL_BLOCK_ROWS", 256)
     default_azimuth: float = 315.0
     default_altitude: float = 45.0
 
@@ -31,3 +34,5 @@ def ensure_dirs() -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     (settings.data_dir / "datasets").mkdir(exist_ok=True)
     (settings.data_dir / "tmp").mkdir(exist_ok=True)
+    (settings.data_dir / "jobs").mkdir(exist_ok=True)
+    (settings.data_dir / "results").mkdir(exist_ok=True)

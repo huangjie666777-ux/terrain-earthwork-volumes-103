@@ -5,15 +5,20 @@ from __future__ import annotations
 import threading
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .config import ensure_dirs, settings
+from .grid import GeometryError
+from .jobs import JobError, JobManager, JobStore
 from .storage import Registry, UploadError, VersionError
 from .tiles import TileCache, TileError, TileRenderer
 
 ensure_dirs()
 registry = Registry()
+job_store = JobStore()
+job_store.mark_unfinished_interrupted()
+job_manager = JobManager(job_store, registry)
 renderer = TileRenderer(
     dataset_dir=str(registry.dataset_dir),
     cache=TileCache(),
@@ -25,6 +30,15 @@ app = FastAPI(title="Terrain Hillshade Tiles", version="1.0.0")
 class PublishRequest(BaseModel):
     version: str = Field(min_length=1, max_length=128)
     datasets: list[str] = Field(min_length=1, max_length=512)
+
+
+class CutfillRequest(BaseModel):
+    before_version: str = Field(min_length=1, max_length=128)
+    after_version: str = Field(min_length=1, max_length=128)
+    # GeoJSON Polygon/MultiPolygon geometry object in the given UTM metres CRS.
+    region: dict
+    epsg: int = Field(description="UTM EPSG code, e.g. 32647")
+    resolution: float = Field(gt=0, description="regular grid cell size in metres")
 
 
 @app.exception_handler(UploadError)
@@ -43,6 +57,17 @@ def version_handler(_request, exc: VersionError):
 @app.exception_handler(TileError)
 def tile_handler(_request, exc: TileError):
     return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(GeometryError)
+def geometry_handler(_request, exc: GeometryError):
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(JobError)
+def job_handler(_request, exc: JobError):
+    status_code = 404 if "unknown job" in str(exc) else 409
+    return JSONResponse(status_code=status_code, content={"error": str(exc)})
 
 
 @app.get("/health")
@@ -131,5 +156,72 @@ def tile(
     return Response(
         content=png,
         media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@app.post("/cutfill/jobs", status_code=202)
+def submit_cutfill(request: CutfillRequest):
+    try:
+        record = job_manager.submit(
+            before_version=request.before_version,
+            after_version=request.after_version,
+            region_geojson=request.region,
+            epsg=request.epsg,
+            resolution=request.resolution,
+        )
+    except VersionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GeometryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _job_view(record)
+
+
+def _job_view(record: dict) -> dict:
+    return {
+        "id": record["id"],
+        "status": record["status"],
+        "progress": record.get("progress", 0.0),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "error": record.get("error"),
+        "request": record.get("request"),
+        "result": record.get("result"),
+    }
+
+
+@app.get("/cutfill/jobs")
+def list_cutfill_jobs():
+    return {"jobs": [_job_view(record) for record in job_store.list()]}
+
+
+@app.get("/cutfill/jobs/{job_id}")
+def get_cutfill_job(job_id: str):
+    record = job_store.get(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="unknown job")
+    return _job_view(record)
+
+
+@app.post("/cutfill/jobs/{job_id}/cancel", status_code=200)
+def cancel_cutfill_job(job_id: str):
+    try:
+        record = job_manager.cancel(job_id)
+    except JobError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _job_view(record)
+
+
+@app.get("/cutfill/jobs/{job_id}/difference.tif")
+def download_cutfill(job_id: str):
+    try:
+        path = job_manager.get_download(job_id)
+    except JobError as exc:
+        status_code = 404 if "unknown job" in str(exc) or "missing" in str(exc) else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="image/tiff",
+        filename=f"difference-{job_id}.tif",
         headers={"Cache-Control": "private, max-age=3600"},
     )
